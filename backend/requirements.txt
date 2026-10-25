@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+neo4j>=5.26
+chromadb>=0.5.20
+openai>=1.60
+tiktoken>=0.8
+pymupdf>=1.25
+python-multipart>=0.0.18

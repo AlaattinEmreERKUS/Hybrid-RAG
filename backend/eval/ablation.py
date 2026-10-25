@@ -20,6 +20,9 @@ from app.services.graph_store import GraphStore
 from app.services.vector_store import VectorStore
 
 
+ENTITY_CACHE = "eval/entity_cache.json"
+
+
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
@@ -50,11 +53,19 @@ async def main(path: str) -> None:
 
     graph, vectors = GraphStore(), VectorStore()
     await vectors.connect()
-    service = QueryService(graph, vectors, Embedder(), Extractor())
+    extractor = Extractor()
+    service = QueryService(graph, vectors, Embedder(), extractor)
+    # query entities are cached so reruns are free and every run sees the same seeds
+    try:
+        cache = json.load(open(ENTITY_CACHE, encoding="utf-8"))
+    except FileNotFoundError:
+        cache = {}
     chunks = await all_chunks(graph)
     print(f"{len(chunks)} chunks in store, {len(questions)} questions, k={k}\n")
 
-    configs = ["vector", "lexical", "graph", "vector+lexical", "hybrid (all 3)"]
+    graph_weights = [0.5, 0.25]  # down-weighted graph vote, see rrf_merge(weights=)
+    configs = ["vector", "lexical", "graph", "vector+lexical", "hybrid (all 3)"] + [
+        f"hybrid g={w}" for w in graph_weights]
     totals = {c: [0.0, 0.0, 0.0] for c in configs}
     by_type: dict[str, dict[str, list[float]]] = {}  # type -> config -> [hits, count]
     used = 0
@@ -64,7 +75,13 @@ async def main(path: str) -> None:
             print(f"SKIP (no chunk matches evidence): {q['question']}")
             continue
         used += 1
-        vec, lex, ctx = await service.retrieve(q["question"])
+        if q["question"] not in cache:
+            ents = await extractor.extract_query_entities(q["question"])
+            if not ents:  # extractor swallows errors (e.g. daily quota) and returns []
+                sys.exit(f"entity extraction returned nothing, check LLM quota: {q['question']}")
+            cache[q["question"]] = ents
+            json.dump(cache, open(ENTITY_CACHE, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        vec, lex, ctx = await service.retrieve(q["question"], cache[q["question"]])
         gph = ctx.evidence_chunk_ids
         rankings = {
             "vector": vec,
@@ -72,6 +89,8 @@ async def main(path: str) -> None:
             "graph": gph,
             "vector+lexical": rrf_merge([vec, lex]),
             "hybrid (all 3)": rrf_merge([vec, lex, gph]),
+            **{f"hybrid g={w}": rrf_merge([vec, lex, gph], weights=[1.0, 1.0, w])
+               for w in graph_weights},
         }
         marks = []
         for c, ranking in rankings.items():

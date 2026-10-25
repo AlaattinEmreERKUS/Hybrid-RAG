@@ -27,12 +27,15 @@ Cite passage numbers like [1], [2] for every claim.
 {question}"""
 
 
-def rrf_merge(result_lists: list[list[str]], k: int = 60) -> list[str]:
-    """Reciprocal Rank Fusion. Each inner list: chunk_ids ranked best-first."""
+def rrf_merge(result_lists: list[list[str]], k: int = 60,
+              weights: list[float] | None = None) -> list[str]:
+    """Reciprocal Rank Fusion. Each inner list: chunk_ids ranked best-first.
+    weights scale each list's vote (default: all 1.0)."""
+    weights = weights or [1.0] * len(result_lists)
     scores: dict[str, float] = {}
-    for ranking in result_lists:
+    for ranking, w in zip(result_lists, weights):
         for rank, chunk_id in enumerate(ranking):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + w / (k + rank + 1)
     return [cid for cid, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
 
 
@@ -47,15 +50,20 @@ class QueryService:
         self._model = s.generation_model
         self._s = s
 
-    async def retrieve(self, question: str) -> tuple[list[str], list[str], GraphContext]:
-        """Run the three retrieval legs; each list is chunk_ids ranked best-first."""
+    async def retrieve(self, question: str, q_entities: list[str] | None = None
+                       ) -> tuple[list[str], list[str], GraphContext]:
+        """Run the three retrieval legs; each list is chunk_ids ranked best-first.
+        Pass q_entities to skip the LLM call (eval reuses cached entities)."""
         s = self._s
 
-        # leg inputs in parallel: query embedding + query entities
-        (q_emb,), q_entities = await asyncio.gather(
-            self.embedder.embed([question]),
-            self.extractor.extract_query_entities(question),
-        )
+        if q_entities is None:
+            # leg inputs in parallel: query embedding + query entities
+            (q_emb,), q_entities = await asyncio.gather(
+                self.embedder.embed([question]),
+                self.extractor.extract_query_entities(question),
+            )
+        else:
+            (q_emb,) = await self.embedder.embed([question])
         log.info("query entities: %s", q_entities)
 
         # three retrieval legs in parallel

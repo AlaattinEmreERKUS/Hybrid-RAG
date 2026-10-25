@@ -227,14 +227,27 @@ class GraphStore:
             """, names=names, max_seeds=max_seeds, max_triples=max_triples)
             triples = [dict(rec) async for rec in result]
 
-            # evidence chunks cited by edges, deduped in encounter order
+            # chunks that mention the seeds themselves, best seed first: a seed with
+            # no RELATED_TO edges would otherwise contribute no evidence at all
+            result = await session.run("""
+                UNWIND $names AS qname
+                CALL db.index.fulltext.queryNodes('entity_name', qname)
+                YIELD node, score
+                WITH node AS seed, max(score) AS score
+                ORDER BY score DESC LIMIT $max_seeds
+                MATCH (seed)-[:MENTIONED_IN]->(c:Chunk)
+                RETURN c.chunk_id AS chunk_id, max(score) AS score
+                ORDER BY score DESC
+            """, names=names, max_seeds=max_seeds)
+            seed_chunks = [rec["chunk_id"] async for rec in result]
+
+            # evidence: seed mentions, then chunks cited by edges; deduped in order
             seen: set[str] = set()
             evidence: list[str] = []
-            for t in triples:
-                for cid in t.get("chunk_ids") or []:
-                    if cid not in seen:
-                        seen.add(cid)
-                        evidence.append(cid)
+            for cid in seed_chunks + [c for t in triples for c in t.get("chunk_ids") or []]:
+                if cid not in seen:
+                    seen.add(cid)
+                    evidence.append(cid)
 
             node_ids = list({t["source_id"] for t in triples} |
                             {t["target_id"] for t in triples})

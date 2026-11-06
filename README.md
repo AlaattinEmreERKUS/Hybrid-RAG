@@ -1,93 +1,93 @@
-# Hybrid GraphRAG Engine
+# Hybrid RAG
 
-Hybrid retrieval (Vector + Lexical + Graph Traversal) over a Neo4j knowledge graph
-and ChromaDB vector store, with a React split-screen UI (chat + live graph canvas).
+Question answering over a Neo4j knowledge graph and a ChromaDB vector store. Each query runs three retrievers in parallel (vector, fulltext, 2-hop graph traversal), fuses them with Reciprocal Rank Fusion, and returns a cited answer plus the exact subgraph used, which the UI highlights.
 
-## Architecture
+## Does hybrid help? Ablation results
+
+`backend/eval/ablation.py` scores each retriever on a labelled question set (hit@3 shown below; the script also prints recall@k and MRR). Corpus: one chapter of *Designing Data-Intensive Applications* (copyrighted, not included; place your copy in `backend/eval/corpus/`) plus two unrelated lecture PDFs as noise. Easy set = 20 questions (keyword, paraphrase, relational); hard set = 14 questions (no lexical overlap, multi-hop).
+
+| Retriever | hit@3 easy | hit@3 hard |
+|---|---|---|
+| vector | 0.65 | 0.79 |
+| fulltext | 0.95 | 0.71 |
+| graph | 0.65 | 0.14 |
+| vector + fulltext | 0.80 | 0.86 |
+| hybrid (all 3, RRF) | 0.90 | 0.79 |
+
+Takeaway: no single retriever wins on both sets; fusion removes the need to pick one. On the hard set the graph leg alone is weak and adding it did not beat vector + fulltext, so the script also tests a down-weighted graph vote (`hybrid g=0.5`, `g=0.25`).
+
+> Measured with `llama-3.3-70b-versatile` for extraction. Numbers are from the author's measurement notes; the repo has no saved results file. Reproduce them with the commands below.
+
+Reproduce (databases up, document ingested, from `backend/`):
+
+```powershell
+.venv\Scripts\python -m eval.ablation eval/questions.json
+.venv\Scripts\python -m eval.ablation eval/questions_hard.json
+```
+
+## How it works
 
 ```
-PDF/MD upload ─▶ chunker (512 tok, 64 overlap, structure-aware)
-             ├─▶ LLM extraction via Groq (entities/relations/concepts) ─▶ Neo4j (MERGE, idempotent)
-             └─▶ local ONNX MiniLM-L6-v2 embeddings (384d) ─▶ ChromaDB (chunk_id = join key)
+PDF/MD upload -> chunker (512 tok, 64 overlap, structure-aware)
+             |-> LLM extraction via Groq (entities/relations/concepts) -> Neo4j (MERGE, idempotent)
+             '-> local ONNX MiniLM-L6-v2 embeddings (384d) -> ChromaDB (chunk_id = join key)
 
-query ─▶ [vector top-k] + [Neo4j fulltext] + [2-hop graph traversal]
-      ─▶ RRF merge ─▶ generator LLM ─▶ answer + provenance (node/edge/chunk ids)
-      ─▶ frontend highlights exactly the used subgraph
+query -> [vector top-15] + [Neo4j fulltext top-15] + [2-hop graph traversal from query entities]
+      -> RRF merge (k=60) -> top 8 chunks -> generator LLM -> answer + provenance (node/edge/chunk ids)
+      -> frontend highlights exactly the used subgraph
 ```
+
+Stack: FastAPI, Neo4j 5 (with APOC), ChromaDB, Groq (OpenAI-compatible API, default model `llama-3.3-70b-versatile`), local ONNX embeddings, React 18 + Vite + zustand + react-force-graph-2d.
 
 ## Run
 
-### 1. Databases
+Requires Docker, Python, Node.js and a [Groq API key](https://console.groq.com/keys).
 
 ```powershell
+# 1. Databases (Neo4j browser :7474, Chroma :8001)
 docker compose up -d
-```
 
-- Neo4j browser: http://localhost:7474 (neo4j / hybridrag123)
-- Chroma: http://localhost:8001
-
-### 2. Backend
-
-```powershell
+# 2. Backend
 cd backend
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-copy .env.example .env   # then put your real Groq key (gsk_...) in .env
+copy .env.example .env      # put your Groq key (gsk_...) in .env
 .venv\Scripts\uvicorn app.main:app --reload --port 8000
-```
 
-### 3. Frontend
-
-```powershell
+# 3. Frontend (Vite proxies /api to the backend)
 cd frontend
 npm install
-npm run dev
+npm run dev                 # http://localhost:5173
 ```
 
-Open http://localhost:5173 — Vite proxies `/api` to the backend, no CORS pain.
-
-### 4. Ingest + query
-
-UI: "+ Upload doc" button, then ask questions in chat.
-Or via curl:
+Ingest and query from the UI ("+ Upload doc", then chat) or the API:
 
 ```powershell
 curl -F "file=@mydoc.pdf" http://localhost:8000/api/ingest
 curl -X POST http://localhost:8000/api/query -H "Content-Type: application/json" -d "{\"question\": \"...\"}"
 ```
 
+Other endpoints: `GET /api/graph`, `GET /api/health`.
+
 ## Project layout
 
 ```
 backend/app/
-  config.py            pydantic-settings (GRAG_* env vars)
-  models/schemas.py    extraction models + camelCase API contract
-  services/chunker.py  structure-aware sliding window
-  services/extractor.py Groq LLM extraction (JSON mode + Pydantic validation + retry)
-  services/embedder.py  local ONNX MiniLM-L6-v2 embeddings (no API needed)
-  services/graph_store.py Neo4j: schema, MERGE writes, fulltext, 2-hop traversal
+  config.py                pydantic-settings (GRAG_* env vars)
+  models/schemas.py        extraction models + camelCase API contract
+  services/chunker.py      structure-aware sliding window
+  services/extractor.py    Groq LLM extraction (JSON mode + Pydantic validation + retry)
+  services/embedder.py     local ONNX MiniLM-L6-v2 embeddings
+  services/graph_store.py  Neo4j: schema, MERGE writes, fulltext, 2-hop traversal
   services/vector_store.py Chroma async client
-  pipeline/ingest.py    orchestrator (parse -> chunk -> extract -> store)
-  retrieval/retriever.py hybrid legs + RRF + grounded generation
-frontend/src/
-  components/GraphCanvas.tsx  react-force-graph-2d, highlight retrieved subgraph
-  components/ChatPanel.tsx    chat + upload; click answer = highlight sources
-  store/useGraphStore.ts      zustand: graph + highlight state
+  pipeline/ingest.py       parse -> chunk -> extract -> store
+  retrieval/retriever.py   three retrieval legs + RRF + grounded generation
+backend/eval/              ablation.py, labelled questions, test_metrics.py, corpus/
+frontend/src/              ChatPanel, GraphCanvas (highlights retrieved subgraph), zustand store
 ```
 
-## LLM provider
+## Notes
 
-Groq (OpenAI-compatible endpoint). Default model: `llama-3.3-70b-versatile` for both
-extraction and generation (`GRAG_EXTRACTION_MODEL` / `GRAG_GENERATION_MODEL` to override).
-Groq has no embeddings API — embeddings run locally (ONNX MiniLM, downloads ~80MB on
-first use). Free tier is ~30 requests/min: `GRAG_EXTRACTION_CONCURRENCY` defaults to 4;
-large PDFs ingest slowly but won't hit 429s.
-
-## Upgrade path
-
-- Cross-encoder rerank: insert `BAAI/bge-reranker-v2-m3` between RRF and generation
-  (`sentence-transformers`), rerank top 25 -> 8.
-- Entity alias resolution: periodic job, embed entity name+description, merge pairs
-  with cosine > 0.92 via `apoc.refactor.mergeNodes` (APOC already enabled in compose).
-- Scale vector store: swap Chroma for Pgvector + asyncpg pool when single-node Chroma
-  becomes the bottleneck.
+- Groq free tier is about 30 requests/min; `GRAG_EXTRACTION_CONCURRENCY` defaults to 4, so large PDFs ingest slowly but avoid 429s. Embeddings run locally (~80 MB model download on first use).
+- Eval labels are evidence phrases, not chunk ids, so they survive re-ingestion. Query entities are cached in `eval/entity_cache.json` so reruns are free.
+- Not yet implemented: cross-encoder reranking, entity alias merging, a production vector store.
